@@ -1,6 +1,9 @@
 import os
 import json
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,18 +19,44 @@ from google.genai import types
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Console Logging setup
+# ---------------------------------------------------------
+# 0. Render Web Service Port Binding (Health Check)
+# Render'n "Port timeout" jedhee deploy akka hin fashaleessineef
+# ---------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"NATA AI Bot is Live and Healthy!")
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logging.info(f"🌐 Health check HTTP server port {port} irratti ka'eera...")
+    server.serve_forever()
+
+# Background Thread irratti server HTTP kaasuu
+threading.Thread(target=run_health_check_server, daemon=True).start()
+
+# ---------------------------------------------------------
+# 1. Logging Setup
+# ---------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# 1. Environment Variables / Secrets Dubbisuu
+# ---------------------------------------------------------
+# 2. Environment Variables / Secrets Dubbisuu
+# ---------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 FIREBASE_CRED_STR = os.environ.get("FIREBASE_CREDENTIALS")
 
-# 2. Firebase / Firestore Initialize Gochuu
+# ---------------------------------------------------------
+# 3. Firebase / Firestore Initialize Gochuu
+# ---------------------------------------------------------
 db = None
 if FIREBASE_CRED_STR:
     try:
@@ -37,17 +66,21 @@ if FIREBASE_CRED_STR:
         db = firestore.client()
         logging.info("✅ Firebase/Firestore nagaadhaan wal-hiddameera!")
     except Exception as e:
-        logging.error(f"❌ Dogoggora Firebase initialize gochuu irra jiru: {e}")
+        logging.error(f"❌ Firebase initialize error: {e}")
 else:
-    logging.warning("⚠️ FIREBASE_CREDENTIALS secret keessatti hin kaawwamne. Storage malee hojjeta.")
+    logging.warning("⚠️ FIREBASE_CREDENTIALS secret keessatti hin argamne. Storage malee hojjeta.")
 
-# 3. Gemini Client (SDK Ammayyaa) Initialize Gochuu
+# ---------------------------------------------------------
+# 4. Gemini Client Setup (SDK Ammayyaa)
+# ---------------------------------------------------------
 if not GEMINI_API_KEY:
     raise ValueError("❌ GEMINI_API_KEY Environment Variable keessa hin jiru!")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 4. System Instruction (NATA AI Persona & System Metadata Guutuu)
+# ---------------------------------------------------------
+# 5. System Instruction (NATA AI Persona & Metadata)
+# ---------------------------------------------------------
 SYSTEM_INSTRUCTION = """
 You are NATA AI, an advanced, highly capable, strictly truthful, and philosophical AI Tech Mentor Telegram Bot.
 
@@ -75,11 +108,7 @@ Key Creator & System Metadata:
 """
 
 def select_gemini_model(user_query: str) -> str:
-    """
-    Quota API bilisaa akka hin dhumneef model sirrii dynamikiidhaan filata:
-    - gemini-2.0-flash-lite: Gaaffiiwwan gabaaboo fi salphaa ta'aniif (Fast & Token Saver).
-    - gemini-2.0-flash: Koodingii, debug, fiilloosofii fi gaaffiiwwan gadi fageenya qabaniif.
-    """
+    """Quota API bilisaa akka hin dhumneef model dynamic filata."""
     query = user_query.lower()
     keywords = [
         "koodii", "code", "debug", "error", "explain", "ibsi", "build", 
@@ -93,8 +122,10 @@ def select_gemini_model(user_query: str) -> str:
         logging.info("Selected Model: gemini-2.0-flash-lite (Fast & Quota Efficient)")
         return "gemini-2.0-flash-lite"
 
+# ---------------------------------------------------------
+# 6. Firestore Database Operations
+# ---------------------------------------------------------
 def save_chat_to_firestore(user_id: int, role: str, text: str):
-    """Ergaa user fi bot Firestore keessatti kuffisa."""
     if not db:
         return
     try:
@@ -108,7 +139,6 @@ def save_chat_to_firestore(user_id: int, role: str, text: str):
         logging.error(f"Error writing chat to Firestore: {e}")
 
 def get_recent_chat_history(user_id: int, limit: int = 6):
-    """Haasaa dhiyoo godhame Firestore irraa dubbisa."""
     if not db:
         return []
     try:
@@ -124,8 +154,10 @@ def get_recent_chat_history(user_id: int, limit: int = 6):
         logging.error(f"Error fetching chat history: {e}")
         return []
 
+# ---------------------------------------------------------
+# 7. Telegram Command & Message Handlers
+# ---------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command /start yeroo tuqamu deebii kennamu."""
     welcome_text = (
         "<b>Baga nagaan dhuftan! Ani NATA AI.</b> 🧠⚡\n\n"
         "Hiriyaa Teeknoolojii, Koodingii fi Fiiloosofiyaa keessani!\n\n"
@@ -137,20 +169,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, parse_mode='HTML', disable_web_page_preview=True)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ergaa user dubbisee Gemini AI'f erga."""
     user_text = update.message.text
     user_id = update.effective_user.id
 
     if not user_text:
         return
 
-    # Telegram status 'typing...'
+    # Typing indicator
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # 1. Chat history Firestore irraa fudhachuu
+    # History Firestore irraa fudhachuu
     history_docs = get_recent_chat_history(user_id, limit=6)
     
-    # 2. Context Gemini API'f qopheessuu
     contents = []
     for item in history_docs:
         role = "user" if item.get("role") == "user" else "model"
@@ -163,7 +193,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # User message kuffisuu
     save_chat_to_firestore(user_id, "user", user_text)
 
-    # 3. Model dynamic ta'e filachuu
+    # Model dynamic filachu
     chosen_model = select_gemini_model(user_text)
 
     try:
@@ -178,7 +208,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         bot_reply = response.text if response.text else "NATA AI: Deebii uumuu hin dandeenye, mee irra deebiadhu."
 
-        # Bot response kuffisuu
+        # Bot reply kuffisuu
         save_chat_to_firestore(user_id, "model", bot_reply)
 
         # User'f erguu
@@ -188,11 +218,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error calling Gemini API: {e}")
         await update.message.reply_text("⚙️ Dogoggorri teeknikaa uumameera. Mee xiqqoo turtanii irra deebi'aatii try godhaa.")
 
+# ---------------------------------------------------------
+# 8. Main Application Execution
+# ---------------------------------------------------------
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("❌ TELEGRAM_BOT_TOKEN Environment Variable keessa hin jiru!")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
